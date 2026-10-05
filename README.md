@@ -134,6 +134,21 @@ arduino-cli lib install "Adafruit GFX Library"
 
 `Wire` and `EEPROM` are included with the Arduino AVR core.
 
+## Automated tests
+
+The sketch can be run on your computer, without a board or the AVR toolchain:
+
+```bash
+./test/run.sh
+```
+
+This exercises the timing arithmetic, the state machine and the LED/buzzer
+logic, including a `micros()` wrap, which would otherwise mean waiting 71.6
+minutes on real hardware. See [test/README.md](test/README.md).
+
+It is not a substitute for bench testing -- it says nothing about sensor
+polarity, ultrasonic noise, servo power or gate alignment.
+
 ## Checking the code without a board
 
 The Arduino CLI sketch folder must contain a matching `.ino` file:

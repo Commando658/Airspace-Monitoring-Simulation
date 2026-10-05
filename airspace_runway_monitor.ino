@@ -21,6 +21,10 @@
     PARKED     -- summary timer ------> SCANNING
 
   Timing notes:
+    All timestamps are uint32_t, matching the width of micros()/millis() on AVR.
+    The width is stated explicitly because the wrap behaviour below depends on
+    it, and because it lets this file be tested faithfully on a 64-bit host.
+
     micros() wraps every ~71.6 minutes. Unsigned subtraction survives the wrap
     but ordering two raw timestamps does not, so every gate interval is checked
     as an elapsed duration (see intervalWithin).
@@ -79,20 +83,20 @@ const float RUNWAY_GREEN_MIN_MS = 0.15f; // Lower edge of safe rollout.
 const float RUNWAY_GREEN_MAX_MS = 0.40f; // Upper edge of safe rollout.
 
 // Timing and filtering values.
-const unsigned long SONAR_TIMEOUT_US = 12000UL; // pulseIn timeout for a missing echo.
-const unsigned long GATE_LOCKOUT_US = 80000UL;  // Ignore repeat beam breaks.
-const unsigned long ROLLOUT_TIMEOUT_MS = 8000UL; // Give up if gate 3 is not reached.
-const unsigned long SUMMARY_HOLD_MS = 4000UL;   // Summary screen duration.
-const unsigned long GATE_MAX_SEGMENT_US = 5000000UL; // Longest credible gate-to-gate interval.
-const unsigned long RADAR_UPDATE_MS = 70UL;     // Servo/radar update period.
-const unsigned long DISPLAY_UPDATE_MS = 100UL;  // Display refresh period.
-const unsigned long FLASH_INTERVAL_MS = 180UL;  // Red runway LED flash period.
-const unsigned long SLOW_BEEP_INTERVAL_MS = 1200UL; // Approach pulse period.
-const unsigned long SLOW_BEEP_ON_MS = 120UL;     // Approach pulse duration.
-const unsigned long RAPID_BEEP_INTERVAL_MS = 180UL; // Overshoot alarm period.
-const unsigned long RAPID_BEEP_ON_MS = 90UL;     // Overshoot pulse duration.
-const unsigned long SINGLE_BEEP_MS = 130UL;      // One zone-entry beep.
-const unsigned long DOUBLE_GAP_MS = 90UL;        // Gap between double beeps.
+const uint32_t SONAR_TIMEOUT_US = 12000UL; // pulseIn timeout for a missing echo.
+const uint32_t GATE_LOCKOUT_US = 80000UL;  // Ignore repeat beam breaks.
+const uint32_t ROLLOUT_TIMEOUT_MS = 8000UL; // Give up if gate 3 is not reached.
+const uint32_t SUMMARY_HOLD_MS = 4000UL;   // Summary screen duration.
+const uint32_t GATE_MAX_SEGMENT_US = 5000000UL; // Longest credible gate-to-gate interval.
+const uint32_t RADAR_UPDATE_MS = 70UL;     // Servo/radar update period.
+const uint32_t DISPLAY_UPDATE_MS = 100UL;  // Display refresh period.
+const uint32_t FLASH_INTERVAL_MS = 180UL;  // Red runway LED flash period.
+const uint32_t SLOW_BEEP_INTERVAL_MS = 1200UL; // Approach pulse period.
+const uint32_t SLOW_BEEP_ON_MS = 120UL;     // Approach pulse duration.
+const uint32_t RAPID_BEEP_INTERVAL_MS = 180UL; // Overshoot alarm period.
+const uint32_t RAPID_BEEP_ON_MS = 90UL;     // Overshoot pulse duration.
+const uint32_t SINGLE_BEEP_MS = 130UL;      // One zone-entry beep.
+const uint32_t DOUBLE_GAP_MS = 90UL;        // Gap between double beeps.
 
 // Radar plot geometry.
 const uint8_t RADAR_CENTER_X = 64;
@@ -146,8 +150,8 @@ struct PerformanceRecord {
 };
 
 // ISR-owned values are volatile. The main loop copies multi-byte values atomically.
-volatile unsigned long gate1TimestampUs = 0;
-volatile unsigned long gate2TimestampUs = 0;
+volatile uint32_t gate1TimestampUs = 0;
+volatile uint32_t gate2TimestampUs = 0;
 volatile bool gate1Pending = false;
 volatile bool gate2Pending = false;
 
@@ -157,25 +161,25 @@ RunwayBand previousRunwayBand = RUNWAY_TAXIING;
 BuzzerPattern buzzerPattern = BUZZER_OFF;
 PerformanceRecord records;
 
-unsigned long rolloutStartedMs = 0;
-unsigned long summaryStartedMs = 0;
-unsigned long lastRadarUpdateMs = 0;
-unsigned long lastDisplayUpdateMs = 0;
-unsigned long buzzerStartedMs = 0;
-unsigned long flashStartedMs = 0;
+uint32_t rolloutStartedMs = 0;
+uint32_t summaryStartedMs = 0;
+uint32_t lastRadarUpdateMs = 0;
+uint32_t lastDisplayUpdateMs = 0;
+uint32_t buzzerStartedMs = 0;
+uint32_t flashStartedMs = 0;
 
 // Stable copies of the accepted gate edges. All velocity maths reads these, never
 // the volatile ISR variables -- a second beam break (wing, tail, vibration)
 // overwrites the volatile value even when the event itself is discarded.
-unsigned long gate1AcceptedUs = 0;
-unsigned long gate2AcceptedUs = 0;
+uint32_t gate1AcceptedUs = 0;
+uint32_t gate2AcceptedUs = 0;
 bool gate1Captured = false;
 bool gate2Captured = false;
 
 // Gate 1 repeat-break lockout. Kept outside clearMotionData() so that resetting a
 // run does not also disarm the debounce. A separate flag is used because 0 is a
 // legal micros() value just after the wrap.
-unsigned long gate1LockoutUs = 0;
+uint32_t gate1LockoutUs = 0;
 bool gate1LockoutArmed = false;
 
 bool displayReady = false;
@@ -209,12 +213,12 @@ void gate2ISR() {
 // micros() wraps every ~71.6 minutes. (end - start) is correct across the wrap
 // for unsigned arithmetic; (end > start) is not. Every interval is validated here
 // as a duration so a pass straddling the wrap is measured rather than discarded.
-bool intervalWithin(unsigned long startUs, unsigned long endUs, unsigned long limitUs) {
-  const unsigned long elapsedUs = endUs - startUs;
+bool intervalWithin(uint32_t startUs, uint32_t endUs, uint32_t limitUs) {
+  const uint32_t elapsedUs = endUs - startUs;
   return elapsedUs > 0UL && elapsedUs <= limitUs;
 }
 
-float segmentVelocity(float distanceCm, unsigned long elapsedUs) {
+float segmentVelocity(float distanceCm, uint32_t elapsedUs) {
   return (distanceCm / 100.0f) / (elapsedUs / 1000000.0f);
 }
 
@@ -235,7 +239,7 @@ float readRangeCm() {
   delayMicroseconds(10);
   digitalWrite(PIN_SONAR_TRIGGER, LOW);
 
-  const unsigned long durationUs = pulseIn(PIN_SONAR_ECHO, HIGH, SONAR_TIMEOUT_US);
+  const uint32_t durationUs = pulseIn(PIN_SONAR_ECHO, HIGH, SONAR_TIMEOUT_US);
   if (durationUs == 0) {
     return RANGE_NO_ECHO;
   }
@@ -269,7 +273,7 @@ void startBuzzer(BuzzerPattern pattern) {
 }
 
 void updateBuzzer() {
-  const unsigned long elapsedMs = millis() - buzzerStartedMs;
+  const uint32_t elapsedMs = millis() - buzzerStartedMs;
   bool on = false;
 
   switch (buzzerPattern) {
@@ -376,9 +380,9 @@ void resetToScanning() {
   clearMotionData(true);
 }
 
-void acceptGate1(unsigned long timestampUs) {
+void acceptGate1(uint32_t timestampUs) {
   if (gate1LockoutArmed &&
-      (unsigned long)(timestampUs - gate1LockoutUs) < GATE_LOCKOUT_US) {
+      (uint32_t)(timestampUs - gate1LockoutUs) < GATE_LOCKOUT_US) {
     return;
   }
   clearMotionData(false);  // Clears the snapshots, so record the edge afterwards.
@@ -393,7 +397,7 @@ void acceptGate1(unsigned long timestampUs) {
 
 void processGateEvents() {
   bool gate1Event = false;
-  unsigned long gate1Us = 0;
+  uint32_t gate1Us = 0;
 
   noInterrupts();
   if (gate1Pending) {
@@ -411,9 +415,9 @@ void processGateEvents() {
   }
 }
 
-void calculateMotion(unsigned long gate3Us) {
-  const unsigned long segment1Us = gate2AcceptedUs - gate1AcceptedUs;
-  const unsigned long segment2Us = gate3Us - gate2AcceptedUs;
+void calculateMotion(uint32_t gate3Us) {
+  const uint32_t segment1Us = gate2AcceptedUs - gate1AcceptedUs;
+  const uint32_t segment2Us = gate3Us - gate2AcceptedUs;
   if (segment1Us == 0UL || segment2Us == 0UL) {
     return;
   }
@@ -424,7 +428,7 @@ void calculateMotion(unsigned long gate3Us) {
   haveVelocity2 = true;
 
   // Each segment's average velocity belongs at its midpoint, not at either gate.
-  const unsigned long midpointDeltaUs = (segment1Us / 2UL) + (segment2Us / 2UL);
+  const uint32_t midpointDeltaUs = (segment1Us / 2UL) + (segment2Us / 2UL);
   if (midpointDeltaUs > 0) {
     accelerationMs2 = (velocity2Ms - velocity1Ms) /
                       (midpointDeltaUs / 1000000.0f);
@@ -433,7 +437,7 @@ void calculateMotion(unsigned long gate3Us) {
 }
 
 void processGate2Timestamp() {
-  unsigned long gate2Us = 0;
+  uint32_t gate2Us = 0;
   bool pending = false;
   noInterrupts();
   if (gate2Pending) {
@@ -447,7 +451,7 @@ void processGate2Timestamp() {
     return;
   }
   if (gate2Captured &&
-      (unsigned long)(gate2Us - gate2AcceptedUs) < GATE_LOCKOUT_US) {
+      (uint32_t)(gate2Us - gate2AcceptedUs) < GATE_LOCKOUT_US) {
     return;  // Repeat break of the same beam.
   }
   if (!intervalWithin(gate1AcceptedUs, gate2Us, GATE_MAX_SEGMENT_US)) {
@@ -468,7 +472,7 @@ void pollGate3() {
     return;
   }
   const bool active = digitalRead(PIN_GATE_3) == LOW;
-  const unsigned long gate3Us = micros();
+  const uint32_t gate3Us = micros();
   const bool triggered = active && !gate3PreviousActive;
   gate3PreviousActive = active;
   if (!triggered || !gate2Captured) {

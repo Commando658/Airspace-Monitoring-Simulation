@@ -19,6 +19,16 @@
     ROLLING_OUT -- valid gate 3 edge --> PARKED
     ROLLING_OUT -- 8 s timeout ------> SCANNING
     PARKED     -- summary timer ------> SCANNING
+
+  Timing notes:
+    micros() wraps every ~71.6 minutes. Unsigned subtraction survives the wrap
+    but ordering two raw timestamps does not, so every gate interval is checked
+    as an elapsed duration (see intervalWithin).
+
+    Gates 1 and 2 are interrupt driven. Gate 3 is polled, so the main loop must
+    never block while a rollout is in progress -- pushing the 1 KB framebuffer
+    over I2C takes ~23 ms, which would land directly in the measurement. The
+    telemetry screen is therefore redrawn only when its contents change.
 */
 
 #include <Arduino.h>
@@ -55,8 +65,14 @@ const float GATE_2_TO_3_CM = 15.0f; // Distance from gate 2 to gate 3.
 // Airspace thresholds in centimetres.
 const float AIR_GREEN_MIN_CM = 10.0f; // Lower edge of the optimal airspace band.
 const float AIR_GREEN_MAX_CM = 25.0f; // Upper edge of the optimal airspace band.
-const float SONAR_MIN_CM = 2.0f;      // Reject echoes closer than this.
+const float SONAR_MIN_CM = 2.0f;      // Below this the HC-SR04 cannot resolve range.
 const float SONAR_MAX_CM = 200.0f;    // Reject echoes farther than this.
+
+// readRangeCm() sentinels. A target too close to measure is still a target, so
+// it is reported separately from "nothing came back" and escalated to an
+// intrusion rather than being shown as clear airspace.
+const float RANGE_NO_ECHO = -1.0f;
+const float RANGE_TOO_CLOSE = -2.0f;
 
 // Runway velocity thresholds in metres per second.
 const float RUNWAY_GREEN_MIN_MS = 0.15f; // Lower edge of safe rollout.
@@ -67,7 +83,7 @@ const unsigned long SONAR_TIMEOUT_US = 12000UL; // pulseIn timeout for a missing
 const unsigned long GATE_LOCKOUT_US = 80000UL;  // Ignore repeat beam breaks.
 const unsigned long ROLLOUT_TIMEOUT_MS = 8000UL; // Give up if gate 3 is not reached.
 const unsigned long SUMMARY_HOLD_MS = 4000UL;   // Summary screen duration.
-const unsigned long GATE_3_POLL_MS = 2UL;       // Gate 3 polling interval.
+const unsigned long GATE_MAX_SEGMENT_US = 5000000UL; // Longest credible gate-to-gate interval.
 const unsigned long RADAR_UPDATE_MS = 70UL;     // Servo/radar update period.
 const unsigned long DISPLAY_UPDATE_MS = 100UL;  // Display refresh period.
 const unsigned long FLASH_INTERVAL_MS = 180UL;  // Red runway LED flash period.
@@ -85,8 +101,10 @@ const uint8_t RADAR_RADIUS = 45;
 const uint8_t RADAR_ARC_1 = 15;
 const uint8_t RADAR_ARC_2 = 30;
 const uint8_t RADAR_ARC_3 = 45;
+const uint8_t RADAR_STEP_DEG = 3;               // Sweep step; 1 deg took 12.6 s per pass.
+const float RADAR_DISPLAY_MAX_CM = 60.0f;       // Range mapped to the outermost arc.
 
-const uint16_t EEPROM_MAGIC = 0xA53C; // Marks initialized performance records.
+const uint16_t EEPROM_MAGIC = 0xA53D; // Bumped: record layout gained completedRuns.
 const int EEPROM_RECORD_ADDRESS = 0;
 
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -122,6 +140,7 @@ enum BuzzerPattern : uint8_t {
 
 struct PerformanceRecord {
   uint16_t magic;
+  uint16_t completedRuns;
   float fastestVelocity;
   float highestAcceleration;
 };
@@ -140,25 +159,42 @@ PerformanceRecord records;
 
 unsigned long rolloutStartedMs = 0;
 unsigned long summaryStartedMs = 0;
-unsigned long lastGate3PollMs = 0;
 unsigned long lastRadarUpdateMs = 0;
 unsigned long lastDisplayUpdateMs = 0;
 unsigned long buzzerStartedMs = 0;
 unsigned long flashStartedMs = 0;
-unsigned long lastGate1AcceptedUs = 0;
-unsigned long lastGate2AcceptedUs = 0;
 
+// Stable copies of the accepted gate edges. All velocity maths reads these, never
+// the volatile ISR variables -- a second beam break (wing, tail, vibration)
+// overwrites the volatile value even when the event itself is discarded.
+unsigned long gate1AcceptedUs = 0;
+unsigned long gate2AcceptedUs = 0;
+bool gate1Captured = false;
+bool gate2Captured = false;
+
+// Gate 1 repeat-break lockout. Kept outside clearMotionData() so that resetting a
+// run does not also disarm the debounce. A separate flag is used because 0 is a
+// legal micros() value just after the wrap.
+unsigned long gate1LockoutUs = 0;
+bool gate1LockoutArmed = false;
+
+bool displayReady = false;
+bool telemetryDirty = false;
 bool gate3PreviousActive = false;
-bool gate2Accepted = false;
 bool haveVelocity1 = false;
 bool haveVelocity2 = false;
 bool haveAcceleration = false;
 float velocity1Ms = 0.0f;
 float velocity2Ms = 0.0f;
 float accelerationMs2 = 0.0f;
-float radarRangeCm = -1.0f;
+float radarRangeCm = RANGE_NO_ECHO;
 uint8_t radarAngle = 0;
 int8_t radarDirection = 1;
+
+// Forward declarations. The Arduino preprocessor would synthesise these, but
+// declaring them keeps the file buildable as ordinary C++ too.
+void updateBuzzer();
+void clearMotionData(bool clearGate2Event);
 
 void gate1ISR() {
   gate1TimestampUs = micros();
@@ -170,6 +206,28 @@ void gate2ISR() {
   gate2Pending = true;
 }
 
+// micros() wraps every ~71.6 minutes. (end - start) is correct across the wrap
+// for unsigned arithmetic; (end > start) is not. Every interval is validated here
+// as a duration so a pass straddling the wrap is measured rather than discarded.
+bool intervalWithin(unsigned long startUs, unsigned long endUs, unsigned long limitUs) {
+  const unsigned long elapsedUs = endUs - startUs;
+  return elapsedUs > 0UL && elapsedUs <= limitUs;
+}
+
+float segmentVelocity(float distanceCm, unsigned long elapsedUs) {
+  return (distanceCm / 100.0f) / (elapsedUs / 1000000.0f);
+}
+
+RunwayBand bandForSpeed(float speedMs) {
+  if (speedMs >= RUNWAY_GREEN_MAX_MS) {
+    return RUNWAY_OVERSHOOT;
+  }
+  if (speedMs >= RUNWAY_GREEN_MIN_MS) {
+    return RUNWAY_SAFE;
+  }
+  return RUNWAY_TAXIING;
+}
+
 float readRangeCm() {
   digitalWrite(PIN_SONAR_TRIGGER, LOW);
   delayMicroseconds(2);
@@ -179,12 +237,15 @@ float readRangeCm() {
 
   const unsigned long durationUs = pulseIn(PIN_SONAR_ECHO, HIGH, SONAR_TIMEOUT_US);
   if (durationUs == 0) {
-    return -1.0f;
+    return RANGE_NO_ECHO;
   }
 
   const float distanceCm = durationUs * 0.0343f / 2.0f;
-  if (distanceCm < SONAR_MIN_CM || distanceCm > SONAR_MAX_CM) {
-    return -1.0f;
+  if (distanceCm < SONAR_MIN_CM) {
+    return RANGE_TOO_CLOSE;  // Something is there, just nearer than the sensor can measure.
+  }
+  if (distanceCm > SONAR_MAX_CM) {
+    return RANGE_NO_ECHO;
   }
   return distanceCm;
 }
@@ -204,11 +265,7 @@ void setRunwayLeds(RunwayBand band, bool flashOn) {
 void startBuzzer(BuzzerPattern pattern) {
   buzzerPattern = pattern;
   buzzerStartedMs = millis();
-  if (pattern == BUZZER_CONTINUOUS) {
-    tone(PIN_BUZZER, 2200);
-  } else if (pattern == BUZZER_OFF) {
-    noTone(PIN_BUZZER);
-  }
+  updateBuzzer();  // Apply the new pattern immediately rather than on the next loop.
 }
 
 void updateBuzzer() {
@@ -243,16 +300,19 @@ void updateBuzzer() {
       break;
   }
 
-  if (buzzerPattern == BUZZER_CONTINUOUS || on) {
-    if (buzzerPattern != BUZZER_CONTINUOUS) {
-      tone(PIN_BUZZER, 2200);
-    }
-  } else {
+  // Only touch the timer when the output actually changes; tone() reinitialises
+  // Timer2 on every call and the loop runs thousands of times a second.
+  static bool sounding = false;
+  if (on && !sounding) {
+    tone(PIN_BUZZER, 2200);
+    sounding = true;
+  } else if (!on && sounding) {
     noTone(PIN_BUZZER);
+    sounding = false;
   }
 }
 
-void clearMotionData(bool clearGate2Event = true) {
+void clearMotionData(bool clearGate2Event) {
   noInterrupts();
   gate1Pending = false;
   if (clearGate2Event) {
@@ -262,12 +322,15 @@ void clearMotionData(bool clearGate2Event = true) {
   haveVelocity1 = false;
   haveVelocity2 = false;
   haveAcceleration = false;
-  gate2Accepted = false;
   velocity1Ms = 0.0f;
   velocity2Ms = 0.0f;
   accelerationMs2 = 0.0f;
-  lastGate1AcceptedUs = 0;
-  lastGate2AcceptedUs = 0;
+  gate1Captured = false;
+  gate2Captured = false;
+  gate1AcceptedUs = 0;
+  gate2AcceptedUs = 0;
+  // Seed the gate 3 edge detector from the live pin so a beam that is already
+  // blocked (plane still sitting in the bay) cannot register as a fresh trigger.
   gate3PreviousActive = digitalRead(PIN_GATE_3) == LOW;
 }
 
@@ -277,6 +340,7 @@ void loadRecords() {
       isnan(records.fastestVelocity) ||
       isnan(records.highestAcceleration)) {
     records.magic = EEPROM_MAGIC;
+    records.completedRuns = 0;
     records.fastestVelocity = 0.0f;
     records.highestAcceleration = 0.0f;
     EEPROM.put(EEPROM_RECORD_ADDRESS, records);
@@ -284,7 +348,10 @@ void loadRecords() {
 }
 
 void updateRecords() {
-  bool changed = false;
+  bool changed = true;  // A completed run always bumps the counter.
+  if (records.completedRuns < 0xFFFFU) {
+    records.completedRuns++;
+  }
   if (haveVelocity2 && velocity2Ms > records.fastestVelocity) {
     records.fastestVelocity = velocity2Ms;
     changed = true;
@@ -301,23 +368,27 @@ void updateRecords() {
 void resetToScanning() {
   state = STATE_SCANNING;
   previousAirZone = AIR_NONE;
+  radarRangeCm = RANGE_NO_ECHO;  // Otherwise the first frame redraws the last run's range.
   previousRunwayBand = RUNWAY_TAXIING;
   setAirspaceLeds(AIR_NONE);
   setRunwayLeds(RUNWAY_TAXIING, false);
   startBuzzer(BUZZER_OFF);
-  clearMotionData();
+  clearMotionData(true);
 }
 
 void acceptGate1(unsigned long timestampUs) {
-  if (lastGate1AcceptedUs != 0 &&
-      (unsigned long)(timestampUs - lastGate1AcceptedUs) < GATE_LOCKOUT_US) {
+  if (gate1LockoutArmed &&
+      (unsigned long)(timestampUs - gate1LockoutUs) < GATE_LOCKOUT_US) {
     return;
   }
-  lastGate1AcceptedUs = timestampUs;
+  clearMotionData(false);  // Clears the snapshots, so record the edge afterwards.
+  gate1AcceptedUs = timestampUs;
+  gate1Captured = true;
+  gate1LockoutUs = timestampUs;
+  gate1LockoutArmed = true;
   rolloutStartedMs = millis();
   state = STATE_ROLLING_OUT;
-  clearMotionData(false);
-  lastGate1AcceptedUs = timestampUs;
+  telemetryDirty = true;
 }
 
 void processGateEvents() {
@@ -340,15 +411,15 @@ void processGateEvents() {
   }
 }
 
-void calculateMotion(unsigned long gate1Us, unsigned long gate2Us, unsigned long gate3Us) {
-  const unsigned long segment1Us = gate2Us - gate1Us;
-  const unsigned long segment2Us = gate3Us - gate2Us;
-  if (segment1Us == 0 || segment2Us == 0) {
+void calculateMotion(unsigned long gate3Us) {
+  const unsigned long segment1Us = gate2AcceptedUs - gate1AcceptedUs;
+  const unsigned long segment2Us = gate3Us - gate2AcceptedUs;
+  if (segment1Us == 0UL || segment2Us == 0UL) {
     return;
   }
 
-  velocity1Ms = (GATE_1_TO_2_CM / 100.0f) / (segment1Us / 1000000.0f);
-  velocity2Ms = (GATE_2_TO_3_CM / 100.0f) / (segment2Us / 1000000.0f);
+  velocity1Ms = segmentVelocity(GATE_1_TO_2_CM, segment1Us);
+  velocity2Ms = segmentVelocity(GATE_2_TO_3_CM, segment2Us);
   haveVelocity1 = true;
   haveVelocity2 = true;
 
@@ -363,7 +434,6 @@ void calculateMotion(unsigned long gate1Us, unsigned long gate2Us, unsigned long
 
 void processGate2Timestamp() {
   unsigned long gate2Us = 0;
-  unsigned long gate1Us = 0;
   bool pending = false;
   noInterrupts();
   if (gate2Pending) {
@@ -373,58 +443,56 @@ void processGate2Timestamp() {
   }
   interrupts();
 
-  noInterrupts();
-  gate1Us = gate1TimestampUs;
-  interrupts();
-  if (!pending || state != STATE_ROLLING_OUT ||
-      gate2Us <= gate1Us ||
-      (lastGate2AcceptedUs != 0 &&
-       (unsigned long)(gate2Us - lastGate2AcceptedUs) < GATE_LOCKOUT_US)) {
+  if (!pending || state != STATE_ROLLING_OUT || !gate1Captured) {
     return;
   }
-  lastGate2AcceptedUs = gate2Us;
-
-  const unsigned long elapsedUs = gate2Us - gate1Us;
-  if (elapsedUs > 0) {
-    velocity1Ms = (GATE_1_TO_2_CM / 100.0f) / (elapsedUs / 1000000.0f);
-    haveVelocity1 = true;
-    gate2Accepted = true;
+  if (gate2Captured &&
+      (unsigned long)(gate2Us - gate2AcceptedUs) < GATE_LOCKOUT_US) {
+    return;  // Repeat break of the same beam.
   }
+  if (!intervalWithin(gate1AcceptedUs, gate2Us, GATE_MAX_SEGMENT_US)) {
+    return;
+  }
+
+  gate2AcceptedUs = gate2Us;
+  gate2Captured = true;
+  velocity1Ms = segmentVelocity(GATE_1_TO_2_CM, gate2Us - gate1AcceptedUs);
+  haveVelocity1 = true;
+  telemetryDirty = true;
 }
 
+// Polled every loop iteration rather than on a timer: the quantisation here lands
+// directly in segment 2, so the only acceptable latency is the loop period.
 void pollGate3() {
-  if (state != STATE_ROLLING_OUT ||
-      millis() - lastGate3PollMs < GATE_3_POLL_MS) {
+  if (state != STATE_ROLLING_OUT) {
     return;
   }
-  lastGate3PollMs = millis();
   const bool active = digitalRead(PIN_GATE_3) == LOW;
+  const unsigned long gate3Us = micros();
   const bool triggered = active && !gate3PreviousActive;
   gate3PreviousActive = active;
-  if (!triggered || !gate2Accepted) {
+  if (!triggered || !gate2Captured) {
+    return;
+  }
+  if (!intervalWithin(gate2AcceptedUs, gate3Us, GATE_MAX_SEGMENT_US)) {
     return;
   }
 
-  unsigned long gate1Us = 0;
-  unsigned long gate2Us = 0;
-  noInterrupts();
-  gate1Us = gate1TimestampUs;
-  gate2Us = gate2TimestampUs;
-  interrupts();
-  const unsigned long gate3Us = micros();
-  if (gate2Us > gate1Us) {
-    calculateMotion(gate1Us, gate2Us, gate3Us);
-  }
+  calculateMotion(gate3Us);
   updateRecords();
   summaryStartedMs = millis();
   state = STATE_PARKED;
   startBuzzer(BUZZER_OFF);
-  setRunwayLeds(RUNWAY_SAFE, false);
+  // Report the band actually achieved; lighting green after an overshoot would
+  // contradict the numbers on the summary screen.
+  setRunwayLeds(haveVelocity2 ? bandForSpeed(velocity2Ms) : RUNWAY_TAXIING, true);
 }
 
 void updateAirspace() {
   AirZone zone = AIR_NONE;
-  if (radarRangeCm >= 0.0f) {
+  if (radarRangeCm <= RANGE_TOO_CLOSE) {
+    zone = AIR_INTRUSION;  // Unmeasurably close still means occupied airspace.
+  } else if (radarRangeCm >= 0.0f) {
     if (radarRangeCm < AIR_GREEN_MIN_CM) {
       zone = AIR_INTRUSION;
     } else if (radarRangeCm <= AIR_GREEN_MAX_CM) {
@@ -453,12 +521,7 @@ void updateRunwayFeedback() {
     return;
   }
   const float speed = haveVelocity2 ? velocity2Ms : velocity1Ms;
-  RunwayBand band = RUNWAY_TAXIING;
-  if (speed >= RUNWAY_GREEN_MAX_MS) {
-    band = RUNWAY_OVERSHOOT;
-  } else if (speed >= RUNWAY_GREEN_MIN_MS) {
-    band = RUNWAY_SAFE;
-  }
+  const RunwayBand band = bandForSpeed(speed);
   if (band != previousRunwayBand) {
     previousRunwayBand = band;
     if (band == RUNWAY_SAFE) {
@@ -484,14 +547,16 @@ void drawRadar() {
   display.print(F("A:"));
   display.print(radarAngle);
   display.print(F(" R:"));
-  if (radarRangeCm < 0.0f) {
+  if (radarRangeCm <= RANGE_TOO_CLOSE) {
+    display.print(F("<2cm"));
+  } else if (radarRangeCm < 0.0f) {
     display.print(F("--"));
   } else {
     display.print(radarRangeCm, 0);
     display.print(F("cm"));
   }
   display.setCursor(0, 8);
-  if (radarRangeCm < 0.0f) {
+  if (radarRangeCm == RANGE_NO_ECHO) {
     display.print(F("NO TARGET"));
   } else if (previousAirZone == AIR_APPROACH) {
     display.print(F("APPROACH DETECTED"));
@@ -519,8 +584,10 @@ void drawRadar() {
                    RADAR_BASELINE_Y - sin(sweepRadians) * RADAR_RADIUS,
                    SSD1306_WHITE);
   if (radarRangeCm >= SONAR_MIN_CM && radarRangeCm <= SONAR_MAX_CM) {
+    // Scaled to RADAR_DISPLAY_MAX_CM, not SONAR_MAX_CM: against the 200 cm limit
+    // the whole 10-25 cm working band collapsed into 3 pixels.
     const uint8_t blipRadius = min((uint8_t)RADAR_RADIUS,
-                                   (uint8_t)(radarRangeCm * RADAR_RADIUS / SONAR_MAX_CM));
+                                   (uint8_t)(radarRangeCm * RADAR_RADIUS / RADAR_DISPLAY_MAX_CM));
     const int16_t x = RADAR_CENTER_X + cos(sweepRadians) * blipRadius;
     const int16_t y = RADAR_BASELINE_Y - sin(sweepRadians) * blipRadius;
     display.fillCircle(x, y, 2, SSD1306_WHITE);
@@ -585,7 +652,8 @@ void drawSummary() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.print(F("PARKING SUMMARY"));
+  display.print(F("SUMMARY  RUN "));
+  display.print(records.completedRuns);
   display.setCursor(0, 12);
   display.print(F("V1: "));
   if (haveVelocity1) {
@@ -634,18 +702,29 @@ void updateRadar() {
   radarServo.write(radarAngle);
   radarRangeCm = readRangeCm();
   updateAirspace();
-  if (radarDirection > 0 && radarAngle >= 180) {
+  // Step and reverse in one go; the previous form burned a tick at each end.
+  int16_t nextAngle = (int16_t)radarAngle + (int16_t)radarDirection * (int16_t)RADAR_STEP_DEG;
+  if (nextAngle >= 180) {
+    nextAngle = 180;
     radarDirection = -1;
-  } else if (radarDirection < 0 && radarAngle == 0) {
+  } else if (nextAngle <= 0) {
+    nextAngle = 0;
     radarDirection = 1;
-  } else {
-    radarAngle = (uint8_t)((int16_t)radarAngle + radarDirection);
   }
+  radarAngle = (uint8_t)nextAngle;
 }
 
 void updateDisplay() {
-  if (millis() - lastDisplayUpdateMs < DISPLAY_UPDATE_MS) {
+  if (!displayReady || millis() - lastDisplayUpdateMs < DISPLAY_UPDATE_MS) {
     return;
+  }
+  if (state == STATE_ROLLING_OUT) {
+    // A framebuffer push blocks for ~23 ms at 400 kHz. Gate 3 is polled, so that
+    // would be charged straight to segment 2 -- redraw only on a real change.
+    if (!telemetryDirty) {
+      return;
+    }
+    telemetryDirty = false;
   }
   lastDisplayUpdateMs = millis();
   if (state == STATE_SCANNING) {
@@ -673,9 +752,13 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(400000UL);
-  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
-  display.clearDisplay();
-  display.display();
+  // A missing panel must not take the monitor down with it: the LEDs and buzzer
+  // are the safety-critical outputs and stay live either way.
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
+  if (displayReady) {
+    display.clearDisplay();
+    display.display();
+  }
   radarServo.attach(PIN_SERVO);
   radarServo.write(0);
   loadRecords();

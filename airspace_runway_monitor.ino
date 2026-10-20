@@ -2,14 +2,22 @@
   Airspace & Runway Monitoring System
   Target: Arduino Nano/UNO (ATmega328P)
 
-  Pin map:
-    D2  IR gate 1 / touchdown (INT0)   D9  airspace yellow LED
-    D3  IR gate 2 / speed gate (INT1)  D10 airspace green LED
-    D4  IR gate 3 / parking bay        D11 airspace red LED
-    D5  active buzzer                  D12 runway yellow LED
-    D6  HC-SR04 trigger                A0  runway green LED
-    D7  HC-SR04 echo                   A1  runway red LED
-    D8  servo signal                   A4/A5 OLED SDA/SCL
+  The three runway gates are ultrasonic (HC-SR04), not IR beam-break. See the
+  README for wiring and for how to change the pin map to match your board --
+  everything you need to touch is in the CONFIGURATION block below.
+
+  Pin map (defaults -- change them if your wiring differs):
+    D2  gate 1 trigger    D8  servo signal      A0  runway green LED
+    D3  gate 1 echo       D9  airspace yellow   A1  runway red LED
+    D4  gate 2 trigger    D10 airspace green    A2  gate 3 trigger
+    D13 gate 2 echo       D11 airspace red      A3  gate 3 echo
+    D5  active buzzer     D12 runway yellow     A4/A5 OLED SDA/SCL
+    D6  airspace radar trigger
+    D7  airspace radar echo
+
+  With telemetry on, D0/D1 are the USB serial lines, so every pin on the chip
+  is in use. If you need a pin back, turn off ENABLE_TELEMETRY or, if the
+  servo-mounted radar is not fitted, HAVE_AIRSPACE_RADAR.
 
   Power the SG90 servo from a separate regulated 5 V supply and connect its
   ground to Arduino GND. Do not power the servo from an Arduino I/O pin.
@@ -29,10 +37,19 @@
     but ordering two raw timestamps does not, so every gate interval is checked
     as an elapsed duration (see intervalWithin).
 
-    Gates 1 and 2 are interrupt driven. Gate 3 is polled, so the main loop must
-    never block while a rollout is in progress -- pushing the 1 KB framebuffer
-    over I2C takes ~23 ms, which would land directly in the measurement. The
-    telemetry screen is therefore redrawn only when its contents change.
+    An ultrasonic sensor gives no edge to interrupt on. Each gate has to be
+    triggered and then listened to, so the gates are polled and the timing is
+    only as good as how often we can poll them. Two things protect that:
+
+      - Only one sensor is ever listening. Several HC-SR04s close together hear
+        each other's chirps, and during a rollout only one gate can possibly be
+        next, so we poll that one alone. It avoids the interference and gives
+        the gate that matters the full sample rate (~1.2 ms rather than ~3.5 ms
+        if all three were polled in turn).
+
+      - Nothing else in the loop is allowed to block. Pushing the 1 KB
+        framebuffer over I2C takes ~23 ms, which would land straight inside a
+        measurement, so the telemetry screen is redrawn only when it changes.
 */
 
 #include <Arduino.h>
@@ -42,10 +59,36 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// Hardware pins.
-const uint8_t PIN_GATE_1 = 2;
-const uint8_t PIN_GATE_2 = 3;
-const uint8_t PIN_GATE_3 = 4;
+// ===========================================================================
+// CONFIGURATION -- this is the part you change for your board.
+// ===========================================================================
+
+// Set to 0 if the servo-mounted airspace radar is not fitted. The servo, the
+// radar screen and the three airspace LEDs all drop out with it.
+#define HAVE_AIRSPACE_RADAR 1
+
+// Serial telemetry at 115200: one line per completed run. Useful while you are
+// tuning; costs ~175 bytes of RAM, so turn it off once the numbers are right.
+#define ENABLE_TELEMETRY 1
+
+// Gate sensors. Each needs its own trigger and echo pin -- they cannot share a
+// trigger, because firing them together makes them hear each other.
+const uint8_t PIN_GATE1_TRIG = 2;
+const uint8_t PIN_GATE1_ECHO = 3;
+const uint8_t PIN_GATE2_TRIG = 4;
+const uint8_t PIN_GATE2_ECHO = 13;
+const uint8_t PIN_GATE3_TRIG = A2;
+const uint8_t PIN_GATE3_ECHO = A3;
+
+// How close the plane has to be before a gate counts it as arrived, and how far
+// away it has to get before that gate will count anything again. The gap
+// between the two stops a long fuselage from firing the same gate repeatedly as
+// it slides past. Measure the gap between your sensor and the plane and set
+// GATE_TRIGGER_CM comfortably above it.
+const float GATE_TRIGGER_CM = 20.0f;
+const float GATE_RELEASE_CM = 30.0f;
+const float GATE_MAX_RANGE_CM = 45.0f;  // Beyond this a gate reports "nothing there".
+
 const uint8_t PIN_BUZZER = 5;
 const uint8_t PIN_SONAR_TRIGGER = 6;
 const uint8_t PIN_SONAR_ECHO = 7;
@@ -62,7 +105,9 @@ const uint8_t OLED_WIDTH = 128;
 const uint8_t OLED_HEIGHT = 64;
 const uint8_t OLED_ADDRESS = 0x3C;
 
-// Change these after measuring the track.
+// Measure these along the runway with a ruler and put the real numbers here.
+// Every velocity is distance over time, so if these are wrong every reading the
+// system produces is wrong by the same proportion, silently.
 const float GATE_1_TO_2_CM = 10.0f; // Distance from gate 1 to gate 2.
 const float GATE_2_TO_3_CM = 15.0f; // Distance from gate 2 to gate 3.
 
@@ -78,13 +123,22 @@ const float SONAR_MAX_CM = 200.0f;    // Reject echoes farther than this.
 const float RANGE_NO_ECHO = -1.0f;
 const float RANGE_TOO_CLOSE = -2.0f;
 
-// Runway velocity thresholds in metres per second.
+// Runway velocity thresholds in metres per second. These defaults are slower
+// than walking pace and are almost certainly wrong for a real model aircraft --
+// run a few passes with telemetry on and set them from what you actually see.
 const float RUNWAY_GREEN_MIN_MS = 0.15f; // Lower edge of safe rollout.
 const float RUNWAY_GREEN_MAX_MS = 0.40f; // Upper edge of safe rollout.
 
+// ===========================================================================
+// END OF CONFIGURATION
+// ===========================================================================
+
 // Timing and filtering values.
-const uint32_t SONAR_TIMEOUT_US = 12000UL; // pulseIn timeout for a missing echo.
-const uint32_t GATE_LOCKOUT_US = 80000UL;  // Ignore repeat beam breaks.
+const uint32_t SONAR_TIMEOUT_US = 12000UL; // Radar: listen out to ~2 m.
+// Gates only care about things that are close, so they give up listening much
+// sooner. This matters: it is how long a poll costs when nothing is there, and
+// that cost is the gap between samples while we wait for the plane.
+const uint32_t GATE_TIMEOUT_US = 2600UL;
 const uint32_t ROLLOUT_TIMEOUT_MS = 8000UL; // Give up if gate 3 is not reached.
 const uint32_t SUMMARY_HOLD_MS = 4000UL;   // Summary screen duration.
 const uint32_t GATE_MAX_SEGMENT_US = 5000000UL; // Longest credible gate-to-gate interval.
@@ -149,11 +203,22 @@ struct PerformanceRecord {
   float highestAcceleration;
 };
 
-// ISR-owned values are volatile. The main loop copies multi-byte values atomically.
-volatile uint32_t gate1TimestampUs = 0;
-volatile uint32_t gate2TimestampUs = 0;
-volatile bool gate1Pending = false;
-volatile bool gate2Pending = false;
+// One of these per runway gate. "armed" is what stops a gate firing twice for
+// the same aeroplane: once a gate has counted something it stays disarmed until
+// the range climbs back past GATE_RELEASE_CM, i.e. until the plane has gone.
+struct UltrasonicGate {
+  uint8_t trigPin;
+  uint8_t echoPin;
+  bool armed;
+  float lastRangeCm;
+};
+
+const uint8_t GATE_COUNT = 3;
+UltrasonicGate gates[GATE_COUNT] = {
+  { PIN_GATE1_TRIG, PIN_GATE1_ECHO, true, -1.0f },
+  { PIN_GATE2_TRIG, PIN_GATE2_ECHO, true, -1.0f },
+  { PIN_GATE3_TRIG, PIN_GATE3_ECHO, true, -1.0f },
+};
 
 SystemState state = STATE_SCANNING;
 AirZone previousAirZone = AIR_NONE;
@@ -168,23 +233,17 @@ uint32_t lastDisplayUpdateMs = 0;
 uint32_t buzzerStartedMs = 0;
 uint32_t flashStartedMs = 0;
 
-// Stable copies of the accepted gate edges. All velocity maths reads these, never
-// the volatile ISR variables -- a second beam break (wing, tail, vibration)
-// overwrites the volatile value even when the event itself is discarded.
+// The accepted crossing times. Everything downstream works from these, and they
+// are only written once per gate per run, so a later reading at the same gate
+// cannot move a measurement that has already been taken.
 uint32_t gate1AcceptedUs = 0;
 uint32_t gate2AcceptedUs = 0;
 bool gate1Captured = false;
 bool gate2Captured = false;
 
-// Gate 1 repeat-break lockout. Kept outside clearMotionData() so that resetting a
-// run does not also disarm the debounce. A separate flag is used because 0 is a
-// legal micros() value just after the wrap.
-uint32_t gate1LockoutUs = 0;
-bool gate1LockoutArmed = false;
-
+uint32_t lastSegment2Us = 0;  // Kept for the telemetry line.
 bool displayReady = false;
 bool telemetryDirty = false;
-bool gate3PreviousActive = false;
 bool haveVelocity1 = false;
 bool haveVelocity2 = false;
 bool haveAcceleration = false;
@@ -198,17 +257,10 @@ int8_t radarDirection = 1;
 // Forward declarations. The Arduino preprocessor would synthesise these, but
 // declaring them keeps the file buildable as ordinary C++ too.
 void updateBuzzer();
-void clearMotionData(bool clearGate2Event);
-
-void gate1ISR() {
-  gate1TimestampUs = micros();
-  gate1Pending = true;
-}
-
-void gate2ISR() {
-  gate2TimestampUs = micros();
-  gate2Pending = true;
-}
+void clearMotionData();
+void calculateMotion(uint32_t gate3Us);
+bool pollGate(uint8_t index, uint32_t *detectionUs);
+void reportRun();
 
 // micros() wraps every ~71.6 minutes. (end - start) is correct across the wrap
 // for unsigned arithmetic; (end > start) is not. Every interval is validated here
@@ -232,26 +284,83 @@ RunwayBand bandForSpeed(float speedMs) {
   return RUNWAY_TAXIING;
 }
 
-float readRangeCm() {
-  digitalWrite(PIN_SONAR_TRIGGER, LOW);
+// Ping one sensor and convert the echo to centimetres. Every ultrasonic read in
+// the sketch goes through here, gates and radar alike. echoUsOut, if given, gets
+// the raw round-trip time, which the gates use to work out exactly when the
+// sound reached the plane.
+float readSensorCm(uint8_t trigPin, uint8_t echoPin, uint32_t timeoutUs,
+                   float maxCm, uint32_t *echoUsOut) {
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(PIN_SONAR_TRIGGER, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(PIN_SONAR_TRIGGER, LOW);
+  digitalWrite(trigPin, LOW);
 
-  const uint32_t durationUs = pulseIn(PIN_SONAR_ECHO, HIGH, SONAR_TIMEOUT_US);
+  const uint32_t durationUs = pulseIn(echoPin, HIGH, timeoutUs);
+  if (echoUsOut != NULL) {
+    *echoUsOut = durationUs;
+  }
   if (durationUs == 0) {
-    return RANGE_NO_ECHO;
+    return RANGE_NO_ECHO;  // Nothing came back before we gave up listening.
   }
 
   const float distanceCm = durationUs * 0.0343f / 2.0f;
   if (distanceCm < SONAR_MIN_CM) {
     return RANGE_TOO_CLOSE;  // Something is there, just nearer than the sensor can measure.
   }
-  if (distanceCm > SONAR_MAX_CM) {
+  if (distanceCm > maxCm) {
     return RANGE_NO_ECHO;
   }
   return distanceCm;
+}
+
+float readRangeCm() {
+  return readSensorCm(PIN_SONAR_TRIGGER, PIN_SONAR_ECHO,
+                      SONAR_TIMEOUT_US, SONAR_MAX_CM, NULL);
+}
+
+// Read one gate and say whether the plane has just arrived at it.
+//
+// detectionUs is set to the moment the sound actually reached the plane: the
+// instant we fired, plus half the round trip. Using the same convention at
+// every gate is what matters here -- a constant offset cancels out when we
+// divide distance by elapsed time.
+bool pollGate(uint8_t index, uint32_t *detectionUs) {
+  UltrasonicGate &gate = gates[index];
+  const uint32_t firedAtUs = micros();
+  uint32_t echoUs = 0;
+  const float rangeCm = readSensorCm(gate.trigPin, gate.echoPin,
+                                     GATE_TIMEOUT_US, GATE_MAX_RANGE_CM, &echoUs);
+  gate.lastRangeCm = rangeCm;
+
+  // Closer than the sensor can measure still counts as something being there.
+  const bool somethingThere = (rangeCm <= RANGE_TOO_CLOSE) ||
+                              (rangeCm >= 0.0f && rangeCm <= GATE_TRIGGER_CM);
+
+  if (!somethingThere) {
+    if (rangeCm == RANGE_NO_ECHO || rangeCm >= GATE_RELEASE_CM) {
+      gate.armed = true;  // Clear again, so this gate can count the next arrival.
+    }
+    return false;
+  }
+  if (!gate.armed) {
+    return false;  // Same aeroplane, still in front of the sensor.
+  }
+  gate.armed = false;
+  if (detectionUs != NULL) {
+    *detectionUs = firedAtUs + (echoUs / 2UL);
+  }
+  return true;
+}
+
+// Called when a run ends. Each gate is read once so that a plane still sitting
+// in front of a sensor leaves that gate disarmed, rather than counting itself
+// the instant the next run begins.
+void rearmGates() {
+  for (uint8_t index = 0; index < GATE_COUNT; index++) {
+    gates[index].armed = true;
+    pollGate(index, NULL);
+  }
 }
 
 void setAirspaceLeds(AirZone zone) {
@@ -316,13 +425,7 @@ void updateBuzzer() {
   }
 }
 
-void clearMotionData(bool clearGate2Event) {
-  noInterrupts();
-  gate1Pending = false;
-  if (clearGate2Event) {
-    gate2Pending = false;
-  }
-  interrupts();
+void clearMotionData() {
   haveVelocity1 = false;
   haveVelocity2 = false;
   haveAcceleration = false;
@@ -333,9 +436,6 @@ void clearMotionData(bool clearGate2Event) {
   gate2Captured = false;
   gate1AcceptedUs = 0;
   gate2AcceptedUs = 0;
-  // Seed the gate 3 edge detector from the live pin so a beam that is already
-  // blocked (plane still sitting in the bay) cannot register as a fresh trigger.
-  gate3PreviousActive = digitalRead(PIN_GATE_3) == LOW;
 }
 
 void loadRecords() {
@@ -369,6 +469,26 @@ void updateRecords() {
   }
 }
 
+// One line per completed run, so the numbers can be checked against a stopwatch
+// and the speed bands set from real passes instead of guesswork.
+#if ENABLE_TELEMETRY
+void reportRun() {
+  Serial.print(records.completedRuns);
+  Serial.print(',');
+  Serial.print(gate2AcceptedUs - gate1AcceptedUs);
+  Serial.print(',');
+  Serial.print(lastSegment2Us);
+  Serial.print(',');
+  Serial.print(velocity1Ms, 3);
+  Serial.print(',');
+  Serial.print(velocity2Ms, 3);
+  Serial.print(',');
+  Serial.println(accelerationMs2, 3);
+}
+#else
+void reportRun() {}
+#endif
+
 void resetToScanning() {
   state = STATE_SCANNING;
   previousAirZone = AIR_NONE;
@@ -377,47 +497,81 @@ void resetToScanning() {
   setAirspaceLeds(AIR_NONE);
   setRunwayLeds(RUNWAY_TAXIING, false);
   startBuzzer(BUZZER_OFF);
-  clearMotionData(true);
+  clearMotionData();
+  rearmGates();
 }
 
+// Touchdown: the plane has reached the first gate and the run begins.
 void acceptGate1(uint32_t timestampUs) {
-  if (gate1LockoutArmed &&
-      (uint32_t)(timestampUs - gate1LockoutUs) < GATE_LOCKOUT_US) {
-    return;
-  }
-  clearMotionData(false);  // Clears the snapshots, so record the edge afterwards.
+  clearMotionData();  // Wipes the snapshots, so record this one afterwards.
   gate1AcceptedUs = timestampUs;
   gate1Captured = true;
-  gate1LockoutUs = timestampUs;
-  gate1LockoutArmed = true;
   rolloutStartedMs = millis();
   state = STATE_ROLLING_OUT;
   telemetryDirty = true;
 }
 
-void processGateEvents() {
-  bool gate1Event = false;
-  uint32_t gate1Us = 0;
-
-  noInterrupts();
-  if (gate1Pending) {
-    gate1Pending = false;
-    gate1Us = gate1TimestampUs;
-    gate1Event = true;
-  }
-  interrupts();
-
-  if (state != STATE_SCANNING) {
+// Second gate: this gives us the first speed, which is enough to drive the
+// runway LEDs while we wait for the plane to reach the end.
+void acceptGate2(uint32_t timestampUs) {
+  if (!gate1Captured ||
+      !intervalWithin(gate1AcceptedUs, timestampUs, GATE_MAX_SEGMENT_US)) {
     return;
   }
-  if (gate1Event) {
-    acceptGate1(gate1Us);
+  gate2AcceptedUs = timestampUs;
+  gate2Captured = true;
+  velocity1Ms = segmentVelocity(GATE_1_TO_2_CM, timestampUs - gate1AcceptedUs);
+  haveVelocity1 = true;
+  telemetryDirty = true;
+}
+
+// Parking bay: the run is over, so work out the numbers and show the summary.
+void acceptGate3(uint32_t timestampUs) {
+  if (!gate2Captured ||
+      !intervalWithin(gate2AcceptedUs, timestampUs, GATE_MAX_SEGMENT_US)) {
+    return;
+  }
+  calculateMotion(timestampUs);
+  updateRecords();
+  reportRun();
+  summaryStartedMs = millis();
+  state = STATE_PARKED;
+  startBuzzer(BUZZER_OFF);
+  // Show the band actually achieved; a green light after an overshoot would
+  // contradict the numbers printed right next to it.
+  setRunwayLeds(haveVelocity2 ? bandForSpeed(velocity2Ms) : RUNWAY_TAXIING, true);
+}
+
+// Only ever one sensor listening at a time. Whichever gate the plane could
+// reach next is the only one worth polling, and polling it alone means it gets
+// every spare cycle instead of a third of them.
+void updateGates() {
+  uint32_t detectionUs = 0;
+
+  if (state == STATE_SCANNING) {
+    if (pollGate(0, &detectionUs)) {
+      acceptGate1(detectionUs);
+    }
+    return;
+  }
+  if (state != STATE_ROLLING_OUT) {
+    return;  // Nothing to watch for while the summary is up.
+  }
+  if (!gate2Captured) {
+    if (pollGate(1, &detectionUs)) {
+      acceptGate2(detectionUs);
+    }
+    return;
+  }
+  if (pollGate(2, &detectionUs)) {
+    acceptGate3(detectionUs);
   }
 }
 
 void calculateMotion(uint32_t gate3Us) {
   const uint32_t segment1Us = gate2AcceptedUs - gate1AcceptedUs;
   const uint32_t segment2Us = gate3Us - gate2AcceptedUs;
+  lastSegment2Us = segment2Us;
   if (segment1Us == 0UL || segment2Us == 0UL) {
     return;
   }
@@ -434,62 +588,6 @@ void calculateMotion(uint32_t gate3Us) {
                       (midpointDeltaUs / 1000000.0f);
     haveAcceleration = true;
   }
-}
-
-void processGate2Timestamp() {
-  uint32_t gate2Us = 0;
-  bool pending = false;
-  noInterrupts();
-  if (gate2Pending) {
-    gate2Pending = false;
-    gate2Us = gate2TimestampUs;
-    pending = true;
-  }
-  interrupts();
-
-  if (!pending || state != STATE_ROLLING_OUT || !gate1Captured) {
-    return;
-  }
-  if (gate2Captured &&
-      (uint32_t)(gate2Us - gate2AcceptedUs) < GATE_LOCKOUT_US) {
-    return;  // Repeat break of the same beam.
-  }
-  if (!intervalWithin(gate1AcceptedUs, gate2Us, GATE_MAX_SEGMENT_US)) {
-    return;
-  }
-
-  gate2AcceptedUs = gate2Us;
-  gate2Captured = true;
-  velocity1Ms = segmentVelocity(GATE_1_TO_2_CM, gate2Us - gate1AcceptedUs);
-  haveVelocity1 = true;
-  telemetryDirty = true;
-}
-
-// Polled every loop iteration rather than on a timer: the quantisation here lands
-// directly in segment 2, so the only acceptable latency is the loop period.
-void pollGate3() {
-  if (state != STATE_ROLLING_OUT) {
-    return;
-  }
-  const bool active = digitalRead(PIN_GATE_3) == LOW;
-  const uint32_t gate3Us = micros();
-  const bool triggered = active && !gate3PreviousActive;
-  gate3PreviousActive = active;
-  if (!triggered || !gate2Captured) {
-    return;
-  }
-  if (!intervalWithin(gate2AcceptedUs, gate3Us, GATE_MAX_SEGMENT_US)) {
-    return;
-  }
-
-  calculateMotion(gate3Us);
-  updateRecords();
-  summaryStartedMs = millis();
-  state = STATE_PARKED;
-  startBuzzer(BUZZER_OFF);
-  // Report the band actually achieved; lighting green after an overshoot would
-  // contradict the numbers on the summary screen.
-  setRunwayLeds(haveVelocity2 ? bandForSpeed(velocity2Ms) : RUNWAY_TAXIING, true);
 }
 
 void updateAirspace() {
@@ -741,12 +839,19 @@ void updateDisplay() {
 }
 
 void setup() {
-  pinMode(PIN_GATE_1, INPUT_PULLUP);
-  pinMode(PIN_GATE_2, INPUT_PULLUP);
-  pinMode(PIN_GATE_3, INPUT_PULLUP);
+#if ENABLE_TELEMETRY
+  Serial.begin(115200);
+#endif
+  for (uint8_t index = 0; index < GATE_COUNT; index++) {
+    pinMode(gates[index].trigPin, OUTPUT);
+    digitalWrite(gates[index].trigPin, LOW);
+    pinMode(gates[index].echoPin, INPUT);
+  }
   pinMode(PIN_BUZZER, OUTPUT);
+#if HAVE_AIRSPACE_RADAR
   pinMode(PIN_SONAR_TRIGGER, OUTPUT);
   pinMode(PIN_SONAR_ECHO, INPUT);
+#endif
   pinMode(PIN_AIR_YELLOW, OUTPUT);
   pinMode(PIN_AIR_GREEN, OUTPUT);
   pinMode(PIN_AIR_RED, OUTPUT);
@@ -763,25 +868,31 @@ void setup() {
     display.clearDisplay();
     display.display();
   }
+#if HAVE_AIRSPACE_RADAR
   radarServo.attach(PIN_SERVO);
   radarServo.write(0);
+#endif
   loadRecords();
-  attachInterrupt(digitalPinToInterrupt(PIN_GATE_1), gate1ISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_GATE_2), gate2ISR, FALLING);
   resetToScanning();
+#if ENABLE_TELEMETRY
+  Serial.println(F("# airspace runway monitor ready"));
+  Serial.println(F("# run,seg1_us,seg2_us,v1_ms,v2_ms,accel_ms2"));
+#endif
 }
 
 void loop() {
-  processGateEvents();
-  processGate2Timestamp();
+  // Watch whichever gate is next. This is the measurement, so it runs first and
+  // nothing below it is allowed to take long.
+  updateGates();
 
   if (state == STATE_SCANNING) {
+#if HAVE_AIRSPACE_RADAR
     updateRadar();
+#endif
   } else if (state == STATE_ROLLING_OUT) {
     updateRunwayFeedback();
-    pollGate3();
     if (millis() - rolloutStartedMs >= ROLLOUT_TIMEOUT_MS) {
-      resetToScanning();
+      resetToScanning();  // Plane never made it to the end; start watching again.
     }
   } else if (millis() - summaryStartedMs >= SUMMARY_HOLD_MS) {
     resetToScanning();

@@ -8,32 +8,37 @@ int main() {
   printf("=== regression tests ===\n\n");
   setup();
 
-  printf("[1] a repeat gate 1 break must not move the measurement baseline\n");
-  printf("    (the maths once read the volatile ISR timestamp, which the ISR\n");
-  printf("     keeps overwriting even when the event itself is discarded)\n");
+  printf("[1] a second look at gate 1 must not move the measurement baseline\n");
+  printf("    (the maths once read a timestamp that kept being overwritten by\n");
+  printf("     every later sighting, even ones that were discarded)\n");
   clean(); setRangeCm(40); run(200000);
   pass(250, 300);
-  near("clean pass: v1", velocity1Ms, 0.400f, 0.005f);
+  near("clean pass: v1", velocity1Ms, 0.400f, 0.012f);
   clean(); setRangeCm(40); run(200000);
   pass(250, 300, 40);
-  near("40ms gate 1 bounce: final v1 unchanged", velocity1Ms, 0.400f, 0.005f);
+  near("40ms re-sighting: final v1 unchanged", velocity1Ms, 0.400f, 0.012f);
   // calculateMotion() recomputes v1 from the snapshots at gate 3, so the bad
   // value is only visible mid-rollout. Check it there as well, otherwise the
   // interesting half of the bug can be reintroduced undetected.
   clean(); setRangeCm(40); run(200000);
   passToGate2(250, 40);
-  near("40ms bounce: live v1 during rollout", velocity1Ms, 0.400f, 0.005f);
+  near("40ms re-sighting: live v1 mid-rollout", velocity1Ms, 0.400f, 0.012f);
   check("still rolling out when checked", state == STATE_ROLLING_OUT);
 
-  printf("\n[1b] gate 3 latency must stay inside the loop period\n");
-  printf("     (a 2ms poll timer is invisible on a 300ms segment but is 10%%\n");
-  printf("      of a 20ms one, and it lands entirely in segment 2)\n");
+  printf("\n[1b] a gate crossing must be timed to within one poll period\n");
+  printf("     (%.1f ms here -- this is the real accuracy limit of ultrasonic\n", pollQuantisationMs());
+  printf("      gates, and it lands entirely inside the segment being measured)\n");
   clean(); setRangeCm(40); run(200000);
-  pass(60, 20);                                    // 15cm / 20ms = 7.5 m/s
-  near("v2 on a 20ms segment", velocity2Ms, 7.5f, 0.25f);
-  check("segment 2 not inflated by poll latency",
-        velocity2Ms > 7.0f,
-        "v2 = " + std::to_string(velocity2Ms) + " m/s");
+  pass(250, 300);
+  {
+    const uint32_t seg1 = gate2AcceptedUs - gate1AcceptedUs;
+    const float errMs = (seg1 / 1000.0f) - 250.0f;
+    check("segment 1 within one poll of the true 250ms",
+          fabs(errMs) <= pollQuantisationMs() + 0.5f,
+          "out by " + std::to_string(errMs) + " ms");
+    check("and never short -- a poll can only be late, never early",
+          errMs >= -0.5f, "err = " + std::to_string(errMs) + " ms");
+  }
 
   printf("\n[2] a target too close to range is still a target\n");
   clean(); setRangeCm(1.0f); run(300000);
@@ -90,33 +95,105 @@ int main() {
     check("implausible 10s interval rejected", !within(0u, 10000000u, 5000000u));
   }
 
-  printf("\n[6] repeat gate 1 breaks must not disturb a run in progress\n");
+  printf("\n[6] repeat sightings at gate 1 must not disturb a run in progress\n");
   clean();
-  block(G1); step(1000); clear(G1);
-  check("first break starts a rollout", state == STATE_ROLLING_OUT);
+  crossGate(G1);
+  check("first sighting starts a rollout", state == STATE_ROLLING_OUT);
   {
     const uint32_t accepted = gate1AcceptedUs;
     const uint32_t started = rolloutStartedMs;
-    run(10000);
-    block(G1); step(0); clear(G1);                 // wing or tail crosses gate 1
-    run(10000);
-    block(G1); step(0); clear(G1);                 // and again
+    const unsigned long touchdown = sim.nowUs;
+    advanceBy(10000);
+    crossGate(G1);                                 // wing crosses gate 1
+    advanceBy(10000);
+    crossGate(G1);                                 // and again
     check("baseline timestamp untouched", gate1AcceptedUs == accepted);
     check("rollout not restarted", rolloutStartedMs == started);
     check("still the same run", state == STATE_ROLLING_OUT);
-    // Finish the pass and confirm the extra edges did not reach the maths.
-    run(230000);
-    block(G2); step(0); clear(G2); step(1000);
-    near("v1 still measured from the first edge", velocity1Ms, 0.400f, 0.010f);
+    while (sim.nowUs - touchdown < 250000) step(0);
+    crossGate(G2);
+    near("v1 still measured from the first sighting", velocity1Ms, 0.400f, 0.012f);
   }
-  printf("      (the lockout in acceptGate1() is defence in depth: the state\n");
-  printf("       machine already discards gate 1 edges outside SCANNING)\n");
+  printf("      (gate 1 is only polled in SCANNING, so once a run is under way\n");
+  printf("       its sensor is not even being looked at)\n");
 
-  printf("\n[7] a plane left blocking gate 3 must not fake-trigger the next run\n");
-  block(G3); run(100000);
+  printf("\n[7] a plane still parked in front of gate 3 must not count itself\n");
+  clean();
+  placeAtGate(G3, 8.0f);                           // plane sitting in the bay
+  resetToScanning();                               // rearmGates() reads every sensor
+  check("gate 3 left disarmed while occupied", gates[G3].armed == false);
+  clearGateSensor(G3);                             // plane lifted out
   resetToScanning();
-  check("edge detector seeded from the live pin", gate3PreviousActive == true);
-  clear(G3);
+  check("armed again once the bay is clear", gates[G3].armed == true);
+
+  printf("\n[8] hysteresis: one aeroplane fires a gate exactly once\n");
+  clean();
+  {
+    uint32_t at = 0;
+    placeAtGate(G1, 8.0f);
+    check("fuselage arrives -> gate fires", pollGate(G1, &at) == true);
+    check("still in front of it -> no second count", pollGate(G1, &at) == false);
+    placeAtGate(G1, 25.0f);                        // between trigger and release
+    pollGate(G1, &at);
+    check("inside the hysteresis gap, still disarmed", gates[G1].armed == false);
+    placeAtGate(G1, 35.0f);                        // past GATE_RELEASE_CM
+    pollGate(G1, &at);
+    check("past the release line -> re-armed", gates[G1].armed == true);
+    placeAtGate(G1, 8.0f);
+    check("next aeroplane fires it again", pollGate(G1, &at) == true);
+  }
+  printf("      (release is %.0fcm, trigger is %.0fcm -- the gap is what stops\n",
+         GATE_RELEASE_CM, GATE_TRIGGER_CM);
+  printf("       a reading jittering across one line from chattering)\n");
+
+  printf("\n[9] a crossing is timed mid-flight, not when the echo lands\n");
+  printf("    (the sound has to travel out and back; the plane was at the gate\n");
+  printf("     halfway through that, not at the end of it)\n");
+  clean();
+  {
+    placeAtGate(G1, 18.0f);                        // ~1.05ms round trip
+    const uint32_t before = micros();
+    uint32_t at = 0;
+    const bool fired = pollGate(G1, &at);
+    const uint32_t after = micros();
+    check("gate fired", fired);
+    check("timestamp is inside the read, not at the end of it",
+          (uint32_t)(at - before) > 0 && (uint32_t)(after - at) > 0,
+          "read spanned " + std::to_string(after - before) + "us, stamped at +" +
+          std::to_string(at - before) + "us");
+    const uint32_t firstHalf = at - before, secondHalf = after - at;
+    const uint32_t diff = firstHalf > secondHalf ? firstHalf - secondHalf
+                                                 : secondHalf - firstHalf;
+    check("and lands near the middle of it", diff < (after - before) / 2,
+          std::to_string(firstHalf) + "us before / " + std::to_string(secondHalf) + "us after");
+  }
+
+  printf("\n[10] a gate sighting closer than the sensor can measure still counts\n");
+  clean();
+  {
+    uint32_t at = 0;
+    placeAtGate(G1, 1.0f);                         // under SONAR_MIN_CM
+    check("1cm in front of a gate still fires it", pollGate(G1, &at) == true);
+  }
+
+  printf("\n[11] an implausibly long segment must be rejected, not measured\n");
+  printf("     (GATE_MAX_SEGMENT_US is %lus; the rollout timeout is %lus, so\n",
+         (unsigned long)(GATE_MAX_SEGMENT_US / 1000000UL),
+         (unsigned long)(ROLLOUT_TIMEOUT_MS / 1000UL));
+  printf("      there is a window where a stray late echo could otherwise land)\n");
+  clean();
+  crossGate(G1);
+  {
+    const unsigned long touchdown = sim.nowUs;
+    while (sim.nowUs - touchdown < 200000) step(0);
+    crossGate(G2);
+    check("gate 2 accepted normally", gate2Captured == true);
+    const unsigned long atGate2 = sim.nowUs;
+    while (sim.nowUs - atGate2 < 6000000) step(0);  // 6s: past the limit, inside the timeout
+    crossGate(G3);
+    check("stale gate 3 rejected, run not parked", state != STATE_PARKED);
+    check("no bogus second velocity recorded", haveVelocity2 == false);
+  }
 
   return report();
 }

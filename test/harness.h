@@ -15,10 +15,11 @@
 Sim sim;
 TwoWire Wire;
 EEPROMClass EEPROM;
+SerialStub Serial;
 #include "../airspace_runway_monitor.ino"
 
 namespace t {
-const uint8_t G1 = 2, G2 = 3, G3 = 4;
+const uint8_t G1 = 0, G2 = 1, G3 = 2;  // gate indices, not pins
 const uint8_t AIR_YELLOW = 9, AIR_GREEN = 10, AIR_RED = 11;
 const uint8_t RUN_YELLOW = 12, RUN_GREEN = A0, RUN_RED = A1;
 
@@ -49,18 +50,33 @@ void seekToJustBeforeMicrosWrap(unsigned long marginUs = 2000) {
   sim.nowUs = 0x100000000UL - marginUs;
 }
 void setRangeCm(float cm) { sim.echoUs = (unsigned long)(cm * 58.31f); }
-void clear(uint8_t pin) { sim.pinState[pin] = HIGH; }
-// attachInterrupt() is a no-op in the stubs, so an edge on gate 1 or gate 2 has
-// to invoke its handler explicitly. Gate 3 is polled, so it only needs the pin.
-void block(uint8_t pin) {
-  sim.pinState[pin] = LOW;
-  if (pin == G1) gate1ISR();
-  if (pin == G2) gate2ISR();
+
+// Put a simulated object a given distance in front of a gate's sensor, or take
+// it away again. The gates are ultrasonic now, so "the plane is here" means a
+// short range on that gate's echo pin, not a pin being pulled low.
+void placeAtGate(uint8_t index, float cm) {
+  const uint8_t pin = gates[index].echoPin;
+  sim.echoPinSet[pin] = true;
+  sim.echoUsPin[pin] = (unsigned long)(cm * 58.31f);
+}
+void clearGateSensor(uint8_t index) {
+  const uint8_t pin = gates[index].echoPin;
+  sim.echoPinSet[pin] = true;
+  sim.echoUsPin[pin] = 0;  // no echo came back = nothing in front of it
+}
+void clearAllGates() {
+  for (uint8_t i = 0; i < GATE_COUNT; i++) clearGateSensor(i);
+}
+// Roll the plane past one gate: it appears, is seen, and moves on.
+void crossGate(uint8_t index, float cm = 8.0f) {
+  placeAtGate(index, cm);
+  step(0);
+  clearGateSensor(index);
 }
 
-// Known-good starting point: all beams clear, scanning, nothing pending.
+// Known-good starting point: nothing in front of any gate, scanning.
 void clean() {
-  clear(G1); clear(G2); clear(G3);
+  clearAllGates();
   resetToScanning();
   run(300000);
 }
@@ -78,32 +94,39 @@ bool screenContains(const char *needle) {
 
 // Drive a complete pass. bounceMs > 0 re-breaks gate 1 that long after the
 // accepted edge, simulating a wing, tail or vibration.
-// Break gate 1 and gate 2 only, leaving the run mid-measurement so the live
-// telemetry can be inspected before calculateMotion() recomputes everything.
-void passToGate2(unsigned long seg1Ms, unsigned long bounceMs = 0) {
-  block(G1); step(1000); clear(G1);
-  unsigned long consumed = 1000;
-  if (bounceMs) {
-    run(bounceMs * 1000); consumed += bounceMs * 1000;
-    block(G1); step(0); clear(G1);
-  }
-  run(seg1Ms * 1000 - consumed);
-  block(G2); step(0); clear(G2); step(1000);
+// Advance until the given amount of time has really elapsed. Each loop()
+// iteration polls a sensor, and a poll costs real time -- up to GATE_TIMEOUT_US
+// when nothing is there -- so we cannot simply add microseconds and call it a
+// segment. This is also exactly where the accuracy limit comes from: a gate is
+// only seen as often as it can be polled.
+void advanceBy(unsigned long us) {
+  const unsigned long target = sim.nowUs + us;
+  while (sim.nowUs < target) step(0);
 }
 
-void pass(unsigned long seg1Ms, unsigned long seg2Ms, unsigned long bounceMs = 0) {
-  block(G1); step(1000); clear(G1);
-  unsigned long consumed = 1000;
+// Roll the plane through gate 1 and gate 2 only, leaving the run part way
+// through so the live telemetry can be inspected before gate 3 recomputes it.
+void passToGate2(unsigned long seg1Ms, unsigned long bounceMs = 0) {
+  crossGate(G1);
+  const unsigned long touchdown = sim.nowUs;
   if (bounceMs) {
-    run(bounceMs * 1000); consumed += bounceMs * 1000;
-    block(G1); step(0); clear(G1);
+    advanceBy(bounceMs * 1000);
+    crossGate(G1);  // wing or tail passes the same sensor again
   }
-  run(seg1Ms * 1000 - consumed);
-  block(G2); step(0); clear(G2); step(1000);
-  run(seg2Ms * 1000 - 1000);
-  // step(0) so loop() runs at the exact instant the beam breaks; run() advances
-  // in 1ms chunks and would otherwise charge a chunk of its own to segment 2.
-  block(G3); step(0); run(10000);
-  clear(G3);  // plane leaves the bay
+  while (sim.nowUs - touchdown < seg1Ms * 1000) step(0);
+  crossGate(G2);
 }
+
+// A complete pass: touchdown, speed gate, parking bay.
+void pass(unsigned long seg1Ms, unsigned long seg2Ms, unsigned long bounceMs = 0) {
+  passToGate2(seg1Ms, bounceMs);
+  const unsigned long atGate2 = sim.nowUs;
+  while (sim.nowUs - atGate2 < seg2Ms * 1000) step(0);
+  crossGate(G3);
+  run(10000);
+}
+
+// Worst-case timing granularity: a gate is polled at best every GATE_TIMEOUT_US
+// while it waits, so that is the most a crossing time can be out by.
+float pollQuantisationMs() { return GATE_TIMEOUT_US / 1000.0f; }
 }  // namespace t
